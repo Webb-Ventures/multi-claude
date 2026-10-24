@@ -7,12 +7,16 @@ multiple Claude Desktop profiles on one Mac.
 - **`claude_code_proxy.py`** configures Desktop's **local Code sessions only** to use
   the gateway, while Desktop keeps its normal account interface and Chat/Cowork
   routing.
-- **`claude_profiles.py`** builds named, colour-coded `.app` launchers with separate
-  Desktop account data and, by default, separate Claude Code configuration.
+- **`claude_profiles.py`** builds named, colour-coded `.app` launchers or optional
+  full runtime copies with separate Desktop account data and, by default,
+  separate Claude Code configuration.
 
-The profile apps launch the **same, untouched `/Applications/Claude.app`**. They do
-not contain patched copies of Claude. Update the original installation normally;
-all profiles use that updated installation when reopened.
+The default **launcher mode** opens the **same, untouched
+`/Applications/Claude.app`**; reopening a launcher uses the current installed
+version. Optional **copy mode** creates an independent, modified runtime app with
+its own running Dock icon/name. Copies are locally ad-hoc signed, **not vendor
+signed or notarized**, and need refreshing after the original is updated. Neither
+mode modifies the original installation.
 
 > **Thanks to [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI).** Its
 > gateway and provider integrations make this workflow possible. Please visit
@@ -28,9 +32,16 @@ subscription entitlements.
 - Separate Desktop profiles mean separate browser data/cookie stores, **not
   separate macOS users or independently isolated Keychains**. Native services,
   hardware credentials, and browser-based SSO can remain shared.
-- Names and coloured icons identify the **launcher apps** in Finder and pinned
-  shortcuts. The running vendor application retains its normal **Claude Dock/menu
-  identity**. This toolkit does not modify the vendor bundle to change that.
+- In default **launcher mode**, names and coloured icons identify the launcher
+  apps in Finder and pinned shortcuts; the running vendor app retains its normal
+  **Claude Dock/menu identity**. **Copy mode** changes the copied app's running
+  Dock icon/name, without changing the original vendor bundle.
+- Copy signing removes vendor-only team identity, protected Keychain access groups
+  and app groups, while retaining ordinary runtime/JIT/capability entitlements.
+  SSO, passkeys, hardware-key authentication and features needing those protected
+  groups are **not guaranteed to work**. Copy mode is not a separate macOS user or
+  an independent Keychain/security boundary. Copy builds refuse known device-managed
+  Claude preference files rather than changing the bundle identity around them.
 - The Desktop corporate-launcher hook deliberately withholds Desktop inference
   credentials from the Code engine. The engine uses gateway authentication.
   **Remote Control and other first-party-authenticated engine services are not
@@ -71,8 +82,8 @@ For Desktop proxy/profile tools:
   ```
 
 Python uses only the standard library. The launcher builder uses the system Swift,
-AppKit, `iconutil`, and `codesign` tools. Generated wrappers are locally ad-hoc
-signed; **the original Claude app is never re-signed**.
+AppKit, `iconutil`, and `codesign` tools. Generated wrappers and runtime copies are
+locally ad-hoc signed; **the original Claude app is never re-signed**.
 
 ## 1. Set up your proxy and private configuration
 
@@ -241,7 +252,8 @@ those paths. Merely copying this repository does not replace an existing launche
 
 ## 4. Create multiple named Desktop profile apps
 
-Create two independently configured launchers:
+Create two independently configured profile apps (lightweight launcher mode by
+default):
 
 ```sh
 python3 -I claude_profiles.py create "Claude Work" --color blue
@@ -275,6 +287,38 @@ Available colours: `blue`, `purple`, `teal`, `green`, `red`, `orange`, `pink`,
 `--icon-svg`, the locally installed Claude icon is framed/badged with that colour.
 No vendor icon assets are distributed in this repo.
 
+### Optional full copies for distinct running Dock icons
+
+Create a new profile with its own runtime copy:
+
+```sh
+python3 -I claude_profiles.py create "Claude Copy" --color teal --mode copy
+```
+
+Or **quit the selected profile**, then convert its existing launcher:
+
+```sh
+python3 -I claude_profiles.py set-icon "Claude Work" --mode copy
+```
+
+Conversion keeps the profile UUID, app path, account and Code config directories,
+proxy opt-in, and existing icon/embedded SVG. It changes the generated app, not
+those account stores. The copied bundle's metadata, icon and current Electron
+helper bundle/executable names are adjusted to match its new `CFBundleName`, as
+required for startup. The installed source app remains untouched. Successful CLI
+builds refresh the generated app's Launch Services registration without restarting
+Finder or the Dock.
+
+To return to a lightweight launcher, quit that profile and run:
+
+```sh
+python3 -I claude_profiles.py set-icon "Claude Work" --mode launcher
+```
+
+Changing icons, converting or refreshing a profile is refused while it is running
+if either its current or requested mode is `copy`; the tool does not stop it for
+you. Copies have their own update/signing caveats; see **Updates** below.
+
 ### Recolour an SVG instead of adding a frame
 
 Supply your own static, path-only SVG to change its background colour directly,
@@ -293,8 +337,9 @@ on a 1024-pixel square canvas, preserving the SVG viewBox aspect ratio. Input mu
 be UTF-8, at most 1 MiB, and contain only flat paths with explicit hex fills. Scripts,
 styles, transforms, external resources and DTD/entity definitions are rejected.
 
-Update an **existing** launcher's icon and optionally relocate it, without
-recreating its profile or changing its account data, Code config, or proxy opt-in:
+Update an **existing** profile app's icon and optionally relocate it, without
+recreating its profile or changing its mode, account data, Code config, or proxy
+opt-in (quit a copy-mode profile first):
 
 ```sh
 python3 -I claude_profiles.py set-icon "Claude Work" --color purple \
@@ -302,7 +347,7 @@ python3 -I claude_profiles.py set-icon "Claude Work" --color purple \
 python3 -I claude_profiles.py set-icon "Claude Work" --color black
 ```
 
-The second command reuses the sanitised SVG embedded in that launcher. Omitting
+The second command reuses the sanitised SVG embedded in that app. Omitting
 `--apps-dir` keeps its current location. An unrelated existing app at the target
 path is never replaced. Re-add a pinned Dock shortcut if it still points to the old
 location; macOS can temporarily cache the previous icon.
@@ -347,16 +392,29 @@ default. This choice does not copy or share Desktop's cookie jars.
 ### Updates
 
 Keep the original `/Applications/Claude.app` installed and update it normally.
-Every launcher points to that path rather than a frozen duplicate. Reopening a
-profile therefore uses the current installed Claude version without rebuilding
-its launcher or moving its account data.
+In **launcher mode**, reopening a profile uses the current installed version
+without rebuilding its launcher or moving its account data. There is no guarantee
+that every in-app updater restart preserves the profile argument; save your work
+and reopen the named launcher if an updater restarts an unexpected profile.
 
-This is not a separate vendor updater for each wrapper, and does not guarantee
-that every in-app updater restart preserves the profile argument. Keep your work
-saved; reopen the named launcher if an updater restarts an unexpected profile.
-A custom source location can be selected at creation with `--source /path/Claude.app`.
+**Copy-mode apps are independent snapshots.** After updating the original, quit
+each copied profile and rebuild it from its current vendor source:
 
-### Remove a launcher without deleting account data
+```sh
+python3 -I claude_profiles.py refresh "Claude Work"
+```
+
+Refresh keeps the mode, app path, UUID, account/Code config directories, proxy
+opt-in, and existing icon/embedded SVG, and records the newly copied source
+version. **Do not use a copy's own in-app updater.** The runtime requests
+`DISABLE_AUTOUPDATER=1`, but not every app build is guaranteed to honour it; this
+is not an updater-isolation guarantee or a separate vendor-supported updater.
+Refresh again from the original if the copy needs rebuilding/re-signing.
+
+A custom source location can be selected at creation with `--source /path/Claude.app`;
+refresh uses the source path already recorded for that profile.
+
+### Remove a profile app without deleting account data
 
 Quit the selected profile first, then:
 
@@ -364,9 +422,10 @@ Quit the selected profile first, then:
 python3 -I claude_profiles.py remove "Claude Work"
 ```
 
-This removes its generated launcher and registry entry. **Desktop account data
-and Code config are retained**, with paths printed for your records. It does not
-terminate a running instance, remove live locks, delete accounts, or purge history.
+This removes its generated launcher or runtime-copy app and registry entry.
+**Desktop account data and Code config are retained**, with paths printed for your
+records. It does not terminate a running instance, remove live locks, delete
+accounts, or purge history.
 
 ## Troubleshooting
 
@@ -376,9 +435,10 @@ terminate a running instance, remove live locks, delete accounts, or purge histo
 - **Desktop still uses a different launcher:** check `status`, then check the
   machine-managed settings. Uninstall an older installation with its original
   script instead of overwriting managed policy manually.
-- **A named launcher shows Claude's usual Dock icon/name:** expected. Finder and
-  pinned launcher shortcuts have the custom appearance; the signed source app
-  retains the vendor identity.
+- **A named launcher shows Claude's usual Dock icon/name:** expected in default
+  launcher mode. For a distinct running icon/name, quit that profile and use
+  `set-icon "NAME" --mode copy`, accepting the signing/auth/update limits above.
+  If a copy shows stale artwork, macOS may be caching its previous icon.
 - **A login link opens another instance:** multiple instances still share the
   vendor's registered URL scheme. Complete sign-in/callback behavior is an
   acceptance test, not an established guarantee. Do not send authentication URLs
@@ -398,14 +458,18 @@ sh -n start-cc.sh
 
 Tests use temporary directories, fake credentials and mocked connectivity/exec.
 They cover configuration validation, folder/argument handling, exact Desktop engine
-forwarding, interrupted policy installation/removal, profile isolation and safe
-rollback. They do not log in to real accounts or make paid model requests.
+forwarding, interrupted policy installation/removal, profile isolation, copy-mode
+conversion/refresh, helper naming, entitlement filtering, signing order and safe
+rollback. Copy builds/signing use synthetic fixtures and mocked native commands.
+Tests do not log in to real accounts or make paid model requests.
 
 Local native checks exercised launcher/icon compilation, generation of two
 profile apps, simultaneous distinct-profile processes, the fresh welcome screen
 and its Get started action, and verification that the original Claude signature
-remained valid. Completed account login, full Code startup inside every new
-account, and an actual source-app update were not automated.
+remained valid. Runtime-copy checks also exercised local signature verification,
+the welcome screen and a distinct running Dock identity. These are startup checks,
+not proof of completed account login, full Code startup inside every new account,
+or a successful source/copy updater cycle; those have not been automated.
 
 Examined Desktop builds: **3.1623.1** for the initial Code-only hook investigation
 and **3.6556.2** for packaged profile behavior. Treat private/undocumented app
@@ -414,9 +478,12 @@ integration as version-sensitive and re-test after updates.
 ## License and acknowledgements
 
 Toolkit source is [MIT licensed](LICENSE), copyright Webb Ventures. Claude and its
-local icon belong to their respective owner; neither the application nor its
-vendor assets are redistributed here.
+local icon belong to their respective owner; no vendor application code, scripts
+or assets are redistributed here. Runtime copies are generated only from your
+locally installed app.
 
 Special thanks again to **[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)**
 and its contributors for the proxy infrastructure and integrations that enable
 these workflows. CLIProxyAPI is a separate project with its own license.
+The [two Claude accounts on a Mac guide](https://melkon.tech/blog/two-claude-accounts-mac)
+provided inspiration for the runtime-copy approach.

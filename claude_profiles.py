@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import platform
 import plistlib
+import pwd
 import re
 import shutil
 import subprocess
@@ -261,15 +262,128 @@ def app_info(profile):
             "NSHighResolutionCapable": True}
 
 
+def mode_metadata(profile, info, mode=None):
+    updated = {**profile, "mode": mode or profile.get("mode", "launcher")}
+    if updated["mode"] not in ("launcher", "copy"):
+        raise ValueError("Choose launcher or copy mode")
+    if updated["mode"] == "copy":
+        updated.update(runtimeExecutable=info.get("CFBundleExecutable", "Claude") + ".real",
+                       sourceVersion=info.get("CFBundleShortVersionString", "unknown"),
+                       sourceBuildVersion=info.get("CFBundleVersion", "unknown"))
+    else:
+        for key in ("runtimeExecutable", "sourceVersion", "sourceBuildVersion"):
+            updated.pop(key, None)
+    return updated
+
+
+def check_copy_policy():
+    preferences = Path("/Library/Managed Preferences")
+    filename = "com.anthropic.claudefordesktop.plist"
+    paths = (preferences / filename, preferences / pwd.getpwuid(os.getuid()).pw_name / filename)
+    if any(path.exists() or path.is_symlink() for path in paths):
+        raise ValueError("Claude is device-managed; copying it under another identity requires administrator review and is not supported")
+
+
+def signing_entitlements(path):
+    result = subprocess.run(["/usr/bin/codesign", "-d", "--entitlements", "-", "--xml", str(path)],
+                            capture_output=True)
+    if result.returncode:
+        raise ValueError(f"Cannot inspect signing entitlements: {path.name}")
+    entitlements = plistlib.loads(result.stdout) if result.stdout.strip() else {}
+    # Ad-hoc copies cannot claim the vendor's team identity or protected groups.
+    protected = {"com.apple.application-identifier", "application-identifier",
+                 "keychain-access-groups", "com.apple.security.application-groups"}
+    return {key: value for key, value in entitlements.items()
+            if key not in protected and not key.startswith("com.apple.developer.")}
+
+
+def sign_copy(bundle, staging):
+    magic = {b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
+             b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca", b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"}
+    targets = []
+    for directory, directories, files in os.walk(bundle, followlinks=False):
+        parent = Path(directory)
+        directories[:] = [name for name in directories if not (parent / name).is_symlink()]
+        if parent != bundle and parent.suffix in (".app", ".framework", ".xpc", ".appex", ".bundle"):
+            targets.append(parent)
+        for name in files:
+            path = parent / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            if not (path.stat().st_mode & 0o111 or path.suffix in (".dylib", ".so", ".node")):
+                continue
+            with path.open("rb") as stream:
+                if stream.read(4) in magic:
+                    targets.append(path)
+    entitlements_file = staging / "signing-entitlements.plist"
+    for path in [*sorted(targets, key=lambda item: len(item.parts), reverse=True), bundle]:
+        entitlements = signing_entitlements(path)
+        command = ["/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none"]
+        if entitlements:
+            entitlements_file.write_bytes(plistlib.dumps(entitlements))
+            command.extend(["--entitlements", entitlements_file])
+        run([*command, path])
+    run(["/usr/bin/codesign", "--verify", "--deep", "--strict", bundle])
+
+
+def rename_helpers(bundle, profile, source_name):
+    frameworks = bundle / "Contents/Frameworks"
+    identifier = app_info(profile)["CFBundleIdentifier"]
+    for suffix, tag in (("", "default"), (" (GPU)", "gpu"), (" (Renderer)", "renderer"), (" (Plugin)", "plugin")):
+        original = frameworks / (source_name + " Helper" + suffix + ".app")
+        if not original.is_dir() or original.is_symlink():
+            raise ValueError("The source Claude helper layout is not supported")
+        info_path = original / "Contents/Info.plist"
+        info = plistlib.loads(info_path.read_bytes())
+        executable = info["CFBundleExecutable"]
+        if Path(executable).name != executable:
+            raise ValueError("Unexpected helper executable path")
+        name = profile["name"] + " Helper" + suffix
+        (original / "Contents/MacOS" / executable).rename(original / "Contents/MacOS" / name)
+        info.update(CFBundleName=name, CFBundleDisplayName=name, CFBundleExecutable=name,
+                    CFBundleIdentifier=identifier + ".helper." + tag)
+        info_path.write_bytes(plistlib.dumps(info))
+        original.rename(frameworks / (name + ".app"))
+
+
 def build_bundle(profile, launcher, source_icon, staging, icon_svg=None):
     bundle = staging / (profile["name"] + ".app")
     contents = bundle / "Contents"
     resources = contents / "Resources"
-    resources.mkdir(parents=True)
-    (contents / "MacOS").mkdir()
-    shutil.copy2(launcher, contents / "MacOS/ProfileLauncher")
-    (contents / "MacOS/ProfileLauncher").chmod(0o755)
-    (contents / "Info.plist").write_bytes(plistlib.dumps(app_info(profile)))
+    if profile.get("mode") == "copy":
+        check_copy_policy()
+        source, info = source_info(Path(profile["sourceApp"]))
+        run(["/usr/bin/codesign", "--verify", "--deep", "--strict", source])
+        result = subprocess.run(["/bin/cp", "-cR", str(source), str(bundle)], capture_output=True)
+        if result.returncode:
+            if bundle.exists():
+                shutil.rmtree(bundle)
+            run(["/usr/bin/ditto", source, bundle])
+        run(["/usr/bin/codesign", "--verify", "--deep", "--strict", bundle])
+        copied_info = plistlib.loads((contents / "Info.plist").read_bytes())
+        if (copied_info != info
+                or copied_info.get("CFBundleShortVersionString", "unknown") != profile["sourceVersion"]
+                or copied_info.get("CFBundleVersion", "unknown") != profile["sourceBuildVersion"]):
+            raise ValueError("The source app changed during the build; retry after its update finishes")
+        executable = contents / "MacOS" / info.get("CFBundleExecutable", "Claude")
+        real = executable.with_name(profile["runtimeExecutable"])
+        if real.exists() or real.is_symlink():
+            raise ValueError("The source already contains a renamed runtime executable")
+        executable.rename(real)
+        metadata = {**info, "CFBundleIdentifier": app_info(profile)["CFBundleIdentifier"],
+                    "CFBundleName": profile["name"], "CFBundleDisplayName": profile["name"],
+                    "CFBundleIconFile": "profile.icns", "MultiClaudeRuntimeCopy": True}
+        for key in ("CFBundleIconName", "LSUIElement", "LSBackgroundOnly", "ElectronTeamID"):
+            metadata.pop(key, None)
+        rename_helpers(bundle, profile, info.get("CFBundleName", "Claude"))
+    else:
+        resources.mkdir(parents=True)
+        (contents / "MacOS").mkdir()
+        executable = contents / "MacOS/ProfileLauncher"
+        metadata = app_info(profile)
+    shutil.copy2(launcher, executable)
+    executable.chmod(0o755)
+    (contents / "Info.plist").write_bytes(plistlib.dumps(metadata))
     write_json(resources / "profile.json", profile)
     words = [word for word in profile["name"].split() if word.casefold() != "claude"]
     initials = "".join(word[0] for word in words[:2]) or "C"
@@ -282,12 +396,15 @@ def build_bundle(profile, launcher, source_icon, staging, icon_svg=None):
     else:
         run([launcher, "--make-icons", source_icon, iconset, profile["color"], initials])
     run(["/usr/bin/iconutil", "--convert", "icns", "--output", resources / "profile.icns", iconset])
-    run(["/usr/bin/codesign", "--force", "--sign", "-", bundle])
-    run(["/usr/bin/codesign", "--verify", "--strict", bundle])
+    if profile.get("mode") == "copy":
+        sign_copy(bundle, staging)
+    else:
+        run(["/usr/bin/codesign", "--force", "--sign", "-", bundle])
+        run(["/usr/bin/codesign", "--verify", "--strict", bundle])
     return bundle
 
 
-def create_profile(name, color, source, root, apps, shared=False, code_proxy="auto", icon_svg=None):
+def create_profile(name, color, source, root, apps, shared=False, code_proxy="auto", icon_svg=None, mode="launcher"):
     name, color = valid_name(name), color_value(color)
     source, info = source_info(source)
     ensure_external(source, root, apps)
@@ -310,6 +427,7 @@ def create_profile(name, color, source, root, apps, shared=False, code_proxy="au
                    "codeConfigDirectory": str(code), "codeProxyEnabled": enabled,
                    "sharedCodeConfig": shared, "appPath": str(destination.resolve()),
                    "iconStyle": "svg" if icon_svg is not None else "badge"}
+        profile = mode_metadata(profile, info, mode)
         own_paths = [desktop, companion, *([] if shared else [code])]
         for path in own_paths:
             if path.exists() or path.is_symlink():
@@ -353,11 +471,13 @@ def checked_bundle(profile):
     return bundle
 
 
-def update_icon(selector, root, color=None, icon_svg=None, apps=None):
+def update_icon(selector, root, color=None, icon_svg=None, apps=None, mode=None):
     with registry_lock(root):
         data = registry(root)
         profile = find_profile(data, selector)
         original = checked_bundle(profile)
+        if (profile.get("mode") == "copy" or mode == "copy") and running_profiles([profile])[profile["id"]]:
+            raise ValueError("This profile is running. Quit that instance before converting or refreshing it; nothing was stopped")
         source, info = source_info(Path(profile["sourceApp"]))
         destination = (apps / (profile["name"] + ".app")) if apps is not None else original
         destination = destination.expanduser()
@@ -372,6 +492,7 @@ def update_icon(selector, root, color=None, icon_svg=None, apps=None):
         updated = {**profile, "color": color_value(color or profile["color"]),
                    "appPath": str(destination), "iconStyle": "svg" if icon_svg is not None else "badge",
                    "launcherRevision": int(profile.get("launcherRevision", 1)) + 1}
+        updated = mode_metadata(updated, info, mode)
         backup = original.with_name(".icon-backup-" + profile["id"] + ".app")
         if backup.exists() or backup.is_symlink():
             raise ValueError("A previous icon update needs inspection before retrying")
@@ -383,6 +504,9 @@ def update_icon(selector, root, color=None, icon_svg=None, apps=None):
             bundle = build_bundle(updated, launcher, icon, staging, icon_svg)
             if destination != original and (destination.exists() or destination.is_symlink()):
                 raise ValueError("The destination appeared during the build; refusing to replace it")
+            checked_bundle(profile)
+            if (profile.get("mode") == "copy" or updated["mode"] == "copy") and running_profiles([profile])[profile["id"]]:
+                raise ValueError("This profile started during the build; quit it and retry; nothing was stopped")
             os.rename(original, backup)
             published = False
             try:
@@ -406,7 +530,7 @@ def running_profiles(profiles):
     output = subprocess.check_output(["/bin/ps", "-axo", "pid=,comm="], text=True)
     for line in output.splitlines():
         parts = line.strip().split(None, 1)
-        if len(parts) != 2 or not parts[1].endswith("/Contents/MacOS/Claude"):
+        if len(parts) != 2 or not parts[1].endswith(("/Contents/MacOS/Claude", "/Contents/MacOS/Claude.real")):
             continue
         pid = int(parts[0])
         command = subprocess.run(["/bin/ps", "-ww", "-p", str(pid), "-o", "command="],
@@ -439,13 +563,22 @@ def remove_profile(selector, root):
     return profile
 
 
+def register_bundle(profile):
+    registrar = Path("/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister")
+    try:
+        run([registrar, "-f", profile["appPath"]])
+    except (OSError, ValueError):
+        print("The app was updated, but Launch Services registration failed. Open its .app from Finder to refresh it.",
+              file=sys.stderr)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
-    for action in ("create", "list", "launch", "status", "remove", "set-icon"):
+    for action in ("create", "list", "launch", "status", "remove", "set-icon", "refresh"):
         sub = commands.add_parser(action)
         sub.add_argument("--root", type=Path, default=DEFAULT_ROOT)
-        if action in ("create", "launch", "remove", "set-icon"):
+        if action in ("create", "launch", "remove", "set-icon", "refresh"):
             sub.add_argument("name")
         if action == "create":
             sub.add_argument("--color", default="blue")
@@ -455,26 +588,38 @@ def main(argv=None):
             sub.add_argument("--code-proxy", choices=("auto", "on", "off"), default="auto")
         if action in ("create", "set-icon"):
             sub.add_argument("--icon-svg", type=Path, help="Recolour the first fill in a static, path-only SVG")
+            sub.add_argument("--mode", choices=("launcher", "copy"), default="launcher" if action == "create" else None,
+                             help="copy modifies and ad-hoc signs a full copy for a distinct running Dock icon")
         if action == "set-icon":
             sub.add_argument("--color")
-            sub.add_argument("--apps-dir", type=Path, help="Also relocate the existing launcher to this directory")
+            sub.add_argument("--apps-dir", type=Path, help="Also relocate the existing app to this directory")
     args = parser.parse_args(argv)
     args.root = args.root.expanduser().resolve()
     if args.action == "create":
         profile = create_profile(args.name, args.color, args.source, args.root,
                                  args.apps_dir.expanduser().resolve(), args.shared_code_config, args.code_proxy,
-                                 args.icon_svg.expanduser().resolve() if args.icon_svg else None)
+                                 args.icon_svg.expanduser().resolve() if args.icon_svg else None, args.mode)
+        register_bundle(profile)
         print("Created:", profile["appPath"])
         print("Desktop account data:", profile["dataDirectory"])
         print("Code config:", profile["codeConfigDirectory"])
         print("Existing Code-only proxy:", "enabled" if profile["codeProxyEnabled"] else "not enabled")
-        print("Sign in separately in this profile. The source app was not copied or modified.")
-    elif args.action == "set-icon":
-        profile = update_icon(args.name, args.root, args.color,
-                              args.icon_svg.expanduser().resolve() if args.icon_svg else None,
-                              args.apps_dir.expanduser() if args.apps_dir else None)
-        print("Updated launcher:", profile["appPath"])
+        print("Mode:", profile["mode"], "— the original source app was not modified.")
+        print("Sign in separately in this profile.")
+    elif args.action in ("set-icon", "refresh"):
+        if args.action == "refresh":
+            profile = update_icon(args.name, args.root)
+        else:
+            profile = update_icon(args.name, args.root, args.color,
+                                  args.icon_svg.expanduser().resolve() if args.icon_svg else None,
+                                  args.apps_dir.expanduser() if args.apps_dir else None, args.mode)
+        register_bundle(profile)
+        print("Updated app:", profile["appPath"])
+        print("Mode:", profile["mode"])
         print("Account data and Code config unchanged:", profile["dataDirectory"], profile["codeConfigDirectory"])
+        if profile["mode"] == "copy":
+            print("Copied Claude version:", profile["sourceVersion"])
+            print("This copy is locally ad-hoc signed, not vendor signed. Refresh it after updating the original.")
     elif args.action == "remove":
         profile = remove_profile(args.name, args.root)
         print("Removed launcher:", profile["name"])
@@ -493,7 +638,9 @@ def main(argv=None):
                 print(json.dumps({"name": profile["name"], "pids": pids[profile["id"]],
                                  "desktop_directory": profile["dataDirectory"],
                                  "code_config": profile["codeConfigDirectory"],
-                                 "code_proxy_enabled": profile["codeProxyEnabled"]}))
+                                 "code_proxy_enabled": profile["codeProxyEnabled"],
+                                 "mode": profile.get("mode", "launcher"),
+                                 "copied_version": profile.get("sourceVersion")}))
         else:
             for profile in data["profiles"]:
                 try:
@@ -502,7 +649,9 @@ def main(argv=None):
                 except (OSError, ValueError):
                     version = "source missing"
                 config = "shared" if profile["sharedCodeConfig"] else "separate"
-                print(f'{profile["name"]} | {profile["color"]} | Code config: {config} | Claude {version} | {profile["appPath"]}')
+                mode = profile.get("mode", "launcher")
+                installed = profile.get("sourceVersion", version)
+                print(f'{profile["name"]} | {profile["color"]} | {mode} | Code config: {config} | Claude {installed} (source {version}) | {profile["appPath"]}')
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Darwin
 
 struct Profile: Codable {
     let schemaVersion: Int
@@ -10,6 +11,7 @@ struct Profile: Codable {
     let codeConfigDirectory: String
     let color: String
     let codeProxyEnabled: Bool
+    let runtimeExecutable: String?
 }
 
 enum ProfileError: LocalizedError {
@@ -97,7 +99,7 @@ func renderIcons(source: String, directory: String, hex: String, initials: Strin
     }
 }
 
-func launchProfile() throws {
+func loadProfile() throws -> Profile {
     guard let manifestURL = Bundle.main.url(forResource: "profile", withExtension: "json") else {
         throw ProfileError.invalid("This launcher has no profile manifest.")
     }
@@ -109,17 +111,14 @@ func launchProfile() throws {
           NSString(string: profile.codeConfigDirectory).isAbsolutePath else {
         throw ProfileError.invalid("The profile manifest is invalid.")
     }
-    let source = URL(fileURLWithPath: profile.sourceApp, isDirectory: true)
-    guard let bundle = Bundle(url: source),
-          bundle.bundleIdentifier == "com.anthropic.claudefordesktop",
-          let executable = bundle.executableURL,
-          FileManager.default.isExecutableFile(atPath: executable.path) else {
-        throw ProfileError.invalid("Claude is missing at \(profile.sourceApp). Restore the original installation or rebuild this launcher with --source.")
-    }
     for path in [profile.dataDirectory, profile.codeConfigDirectory] {
         try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
     }
+    return profile
+}
+
+func profileEnvironment(_ profile: Profile) -> [String: String] {
     var environment = ProcessInfo.processInfo.environment
     let excluded = ["CLAUDE_USER_DATA_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "ELECTRON_RUN_AS_NODE",
                     "NODE_TLS_REJECT_UNAUTHORIZED", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
@@ -128,15 +127,59 @@ func launchProfile() throws {
         environment.removeValue(forKey: key)
     }
     environment["CLAUDE_CONFIG_DIR"] = profile.codeConfigDirectory
+    return environment
+}
+
+func launchProfile() throws {
+    let profile = try loadProfile()
+    let source = URL(fileURLWithPath: profile.sourceApp, isDirectory: true)
+    guard let bundle = Bundle(url: source),
+          bundle.bundleIdentifier == "com.anthropic.claudefordesktop",
+          let executable = bundle.executableURL,
+          FileManager.default.isExecutableFile(atPath: executable.path) else {
+        throw ProfileError.invalid("Claude is missing at \(profile.sourceApp). Restore the original installation or rebuild this launcher with --source.")
+    }
     let child = Process()
     child.executableURL = executable
     // Packaged Claude strips CLAUDE_USER_DATA_DIR; the Chromium argument is required.
     child.arguments = ["--user-data-dir=\(profile.dataDirectory)"]
-    child.environment = environment
+    child.environment = profileEnvironment(profile)
     child.standardInput = FileHandle.nullDevice
     child.standardOutput = FileHandle.nullDevice
     child.standardError = FileHandle.nullDevice
     try child.run()
+}
+
+func execRuntimeCopy() throws {
+    let profile = try loadProfile()
+    guard let name = profile.runtimeExecutable, name.hasSuffix(".real"),
+          name == NSString(string: name).lastPathComponent else {
+        throw ProfileError.invalid("This copy has no valid runtime executable.")
+    }
+    let executable = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS").appendingPathComponent(name)
+    guard FileManager.default.isExecutableFile(atPath: executable.path) else {
+        throw ProfileError.invalid("The copied Claude executable is missing. Refresh this profile app.")
+    }
+    let forwarded = Array(CommandLine.arguments.dropFirst())
+    guard !forwarded.contains(where: { $0 == "--user-data-dir" || $0.hasPrefix("--user-data-dir=") }) else {
+        throw ProfileError.invalid("The profile selects its own account directory; do not override --user-data-dir.")
+    }
+    var environment = profileEnvironment(profile)
+    environment["DISABLE_AUTOUPDATER"] = "1"
+    let arguments = [executable.path, "--user-data-dir=\(profile.dataDirectory)"] + forwarded
+    let argv = arguments.map { strdup($0) } + [nil]
+    let envp = environment.map { strdup("\($0.key)=\($0.value)") } + [nil]
+    defer {
+        for pointer in argv { free(pointer) }
+        for pointer in envp { free(pointer) }
+    }
+    // Replace the wrapper before initializing AppKit so the copy owns one Dock tile.
+    argv.withUnsafeBufferPointer { args in
+        envp.withUnsafeBufferPointer { env in
+            _ = execve(executable.path, args.baseAddress!, env.baseAddress!)
+        }
+    }
+    throw ProfileError.invalid("Could not start the copied Claude executable: \(String(cString: strerror(errno)))")
 }
 
 final class LauncherDelegate: NSObject, NSApplicationDelegate {
@@ -162,6 +205,17 @@ if arguments.count == 6 && ["--make-icons", "--make-flat-icons"].contains(argume
                         flat: arguments[1] == "--make-flat-icons")
     } catch {
         fputs("claude-profile-icon: \(error.localizedDescription)\n", stderr)
+        exit(1)
+    }
+} else if Bundle.main.object(forInfoDictionaryKey: "MultiClaudeRuntimeCopy") as? Bool == true {
+    do {
+        try execRuntimeCopy()
+    } catch {
+        let alert = NSAlert()
+        alert.messageText = "Could not open this Claude copy"
+        alert.informativeText = error.localizedDescription
+        alert.alertStyle = .critical
+        alert.runModal()
         exit(1)
     }
 } else {
