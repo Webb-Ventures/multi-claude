@@ -1,0 +1,23 @@
+# Local credentials and configuration
+config.local.json
+config.*.local.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Generated launchers, icons, build output and runtime data
+*.app/
+*.iconset/
+*.icns
+_build/
+.build/
+*.log
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
