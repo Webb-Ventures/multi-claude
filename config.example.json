@@ -1,0 +1,4 @@
+{
+  "gateway_urls": ["http://localhost:8317/"],
+  "gateway_token": "REPLACE_WITH_YOUR_GATEWAY_TOKEN"
+}
