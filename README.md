@@ -302,12 +302,24 @@ python3 -I claude_code_proxy.py run --dir /srv/project -- -p "summarise this rep
 `run` uses `claude` from `PATH`; pass `--claude /absolute/path/to/claude` to choose
 another.
 
+**Several Claude accounts.** Each Claude Code config directory is its own signed-in
+account. Pick one per session with `--config-dir`, which sets `CLAUDE_CONFIG_DIR`
+for that session, whether it uses the gateway or Remote Control:
+
+```sh
+python3 -I claude_code_proxy.py run --config-dir ~/.claude-work -- --model claude-opus-5-5
+python3 -I claude_code_proxy.py run --config-dir ~/.claude-client -- rc
+```
+
+Without `--config-dir`, `run` keeps any `CLAUDE_CONFIG_DIR` you already exported,
+then `remote_control.config_dir` for Remote Control sessions, then Claude Code's
+default `~/.claude`.
+
 ### Background Remote Control service
 
 To keep a Remote Control session available on the server, sign in once
-interactively with the claude.ai account you want to use (`claude`, then
-`/login`), using the same `remote_control.config_dir` if you set one. Then
-install the service as your normal user:
+interactively with the claude.ai account you want to use
+(`CLAUDE_CONFIG_DIR=<dir> claude`, then `/login`). Then install a service for it:
 
 ```sh
 python3 -I claude_code_proxy.py install --dir /srv/project
@@ -317,24 +329,43 @@ This writes `~/.config/systemd/user/claude-code-remote-control.service`, which r
 `claude_code_proxy.py run -- remote-control`, and then enables and starts it. It
 restarts on failure and starts again at login. Arguments after `--` replace the
 default `remote-control` and must still start a Remote Control session, for example
-`install -- remote-control --name build-server`. The unit holds no credentials; it
-points at your config file. To keep the service running while you are logged out:
+`install -- rc --name build-server`. The unit holds no credentials; it points at
+your config file. Run `install` as the user whose accounts it should use; root is
+fine on a single-user server.
+
+**One service per account or project.** Give each service a `--name`. Each name is
+a separate unit, `claude-code-remote-control-<name>.service`:
+
+```sh
+python3 -I claude_code_proxy.py install --name work --dir ~/src/app -- rc
+python3 -I claude_code_proxy.py install --name client --config-dir ~/.claude-client --dir ~/src/client -- rc
+```
+
+If you exported `CLAUDE_CONFIG_DIR` when installing, the unit records it, because
+systemd does not inherit your shell's environment. `install` warns when that
+directory has no saved sign-in, or when another service already uses the same
+account. Running `install` again with the same name replaces and restarts that
+service.
+
+To keep services running while you are logged out (no `sudo` needed as root):
 
 ```sh
 sudo loginctl enable-linger "$USER"
 ```
 
-Check it, follow its logs, or remove it:
+Check every service (or one with `--name`), follow a log, or remove one:
 
 ```sh
 python3 -I claude_code_proxy.py status
-journalctl --user -u claude-code-remote-control.service -f
-python3 -I claude_code_proxy.py uninstall
+journalctl --user -u claude-code-remote-control-client.service -f
+python3 -I claude_code_proxy.py uninstall --name client
 ```
 
 `install` and `uninstall` refuse to touch a unit file of that name they did not
-create. Without systemd, run `claude_code_proxy.py run -- remote-control` under
-tmux or another supervisor instead.
+create. They work from non-interactive SSH sessions too: if `XDG_RUNTIME_DIR` is
+missing, it is set to `/run/user/<uid>`. Without systemd, run
+`claude_code_proxy.py run -- remote-control` under tmux or another supervisor
+instead.
 
 Starting a Remote Control session headlessly under systemd has not been verified on
 every Claude Code version. Check the logs after installing.

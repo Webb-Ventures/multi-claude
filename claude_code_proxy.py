@@ -60,9 +60,9 @@ ROUTING_ENV = (
 )
 REMOTE_CONTROL_KEYS = {"enabled", "config_dir", "forward_proxy_url", "forward_proxy_ca"}
 PROXY_ENV = ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy")
-SERVICE_NAME = "claude-code-remote-control.service"
+SERVICE_PREFIX = "claude-code-remote-control"
 SERVICE_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "systemd/user"
-SERVICE_STATE = STATE.with_name("linux-service.json")
+SERVICE_LOCK = STATE.with_name("linux-service")
 SERVICE_MARKER = "# Managed by multi-claude claude_code_proxy.py; remove with its uninstall command."
 
 
@@ -152,8 +152,12 @@ def remote_control_environment(parent, settings, use_config_dir=True):
     return env, url
 
 
-def launch_environment(args, settings, parent, use_config_dir=True):
-    """Return (env, notice) for a Claude Code process started with argv ``args``."""
+def launch_environment(args, settings, parent, use_config_dir=True, config_dir=None):
+    """Return (env, notice) for a Claude Code process started with argv ``args``.
+
+    ``config_dir`` selects the Claude Code account directory for this one session
+    (any session type) and overrides ``remote_control.config_dir``.
+    """
     if requests_remote_control(args):
         env, forward = remote_control_environment(parent, settings, use_config_dir)
         if forward:
@@ -161,9 +165,19 @@ def launch_environment(args, settings, parent, use_config_dir=True):
         else:
             notice = ("claude-code-proxy: Remote Control session; inference goes directly to Anthropic on the "
                       "signed-in account, not through the gateway.")
-        return env, notice
-    gateways = [Gateway(url, settings["gateway_token"]) for url in settings["gateway_urls"]]
-    return engine_environment(parent, select_gateway(gateways)), None
+    else:
+        gateways = [Gateway(url, settings["gateway_token"]) for url in settings["gateway_urls"]]
+        env, notice = engine_environment(parent, select_gateway(gateways)), None
+    if config_dir is not None:
+        env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    return env, notice
+
+
+def claude_config_dir(value):
+    path = config_path(str(value), "--config-dir")
+    if not path.is_dir():
+        raise ValueError(f"Claude config directory {path} does not exist")
+    return path
 
 
 def find_claude(claude=None):
@@ -176,14 +190,16 @@ def find_claude(claude=None):
     return executable
 
 
-def run_cli(args, source, claude=None, directory=None):
+def run_cli(args, source, claude=None, directory=None, config_dir=None):
     """Start the Claude CLI through the gateway, or as a Remote Control session."""
     if args and args[0] == "--":
         args = args[1:]
     executable = find_claude(claude)
     if directory is not None and not directory.expanduser().is_dir():
         raise ValueError("Requested working directory does not exist")
-    env, notice = launch_environment(args, load_config(source), os.environ)
+    if config_dir is not None:
+        config_dir = claude_config_dir(config_dir)
+    env, notice = launch_environment(args, load_config(source), os.environ, config_dir=config_dir)
     if directory is not None:
         os.chdir(directory.expanduser())
     if notice:
@@ -489,16 +505,29 @@ def systemd_quote(value):
     return f'"{escaped}"'
 
 
-def service_unit(source, directory, claude, args, path_env):
+def service_name(name=None):
+    """Unit name for one background session; each name is a separate service."""
+    if name is None:
+        return SERVICE_PREFIX + ".service"
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,39}", name):
+        raise ValueError("--name must be 1-40 letters, digits, '-' or '_', starting with a letter or digit")
+    return f"{SERVICE_PREFIX}-{name}.service"
+
+
+def service_unit(source, directory, claude, args, path_env, config_dir=None, name=None):
     command = [str(Path(sys.executable).resolve()), "-I", str(Path(__file__).resolve()), "run",
-               "--config", str(Path(source).resolve()), "--claude", str(claude), "--", *args]
+               "--config", str(Path(source).resolve()), "--claude", str(claude)]
+    if config_dir is not None:
+        command += ["--config-dir", str(config_dir)]
+    command += ["--", *args]
     directory = str(directory)
     if any(ord(c) < 32 or ord(c) == 127 for c in directory):
         raise ValueError("The working directory must not contain control characters")
+    label = f" ({name})" if name else ""
     return "\n".join([
         SERVICE_MARKER,
         "[Unit]",
-        "Description=Claude Code Remote Control through multi-claude",
+        f"Description=Claude Code Remote Control through multi-claude{label}",
         "Wants=network-online.target",
         "After=network-online.target",
         "",
@@ -521,7 +550,15 @@ def systemctl(*args, check=True):
     if executable is None:
         raise ValueError("systemd is not available; run `claude_code_proxy.py run -- remote-control` "
                          "under tmux or another supervisor instead")
-    result = subprocess.run([executable, "--user", *args], capture_output=True, text=True)
+    env = os.environ.copy()
+    if not env.get("XDG_RUNTIME_DIR"):
+        # Non-interactive SSH and su sessions often lack it, and systemctl --user then cannot reach the bus.
+        runtime = Path(f"/run/user/{os.getuid()}")
+        if not runtime.is_dir():
+            raise ValueError(f"No systemd user session for this user ({runtime} is missing); log in once, "
+                             f"or run: loginctl enable-linger {pwd.getpwuid(os.getuid()).pw_name}")
+        env["XDG_RUNTIME_DIR"] = str(runtime)
+    result = subprocess.run([executable, "--user", *args], capture_output=True, text=True, env=env)
     if check and result.returncode:
         raise ValueError(f"systemctl --user {' '.join(args)} failed: {result.stderr.strip() or result.returncode}")
     return result
@@ -537,58 +574,120 @@ def owned_unit(unit):
     return True
 
 
-def install_service(source, directory, args, claude=None, unit_dir=SERVICE_DIR, state=SERVICE_STATE):
-    """Install and start a systemd user service that keeps a Remote Control session running."""
-    if os.geteuid() == 0:
-        raise ValueError("Install the background service as your normal user, not root")
+def managed_units(unit_dir=SERVICE_DIR):
+    units = []
+    for unit in sorted(unit_dir.glob(SERVICE_PREFIX + "*.service")):
+        try:
+            if owned_unit(unit):
+                units.append(unit)
+        except (OSError, ValueError):
+            continue
+    return units
+
+
+def unit_config_dir(unit):
+    """The --config-dir a managed unit passes, or None for the default account."""
+    for line in unit.read_text().splitlines():
+        if line.startswith("ExecStart="):
+            match = re.search(r'"--config-dir" "((?:[^"\\]|\\.)*)"', line)
+            if match:
+                return re.sub(r"\\(.)", r"\1", match[1]).replace("%%", "%").replace("$$", "$")
+    return None
+
+
+def linger_hint():
+    user = pwd.getpwuid(os.getuid()).pw_name
+    result = subprocess.run(["loginctl", "show-user", user, "-p", "Linger", "--value"],
+                            capture_output=True, text=True) if shutil.which("loginctl") else None
+    if result is not None and result.stdout.strip() == "yes":
+        return None
+    prefix = "" if os.geteuid() == 0 else "sudo "
+    return f"To keep it running while you are logged out: {prefix}loginctl enable-linger {user}"
+
+
+def install_service(source, directory, args, claude=None, config_dir=None, name=None, unit_dir=SERVICE_DIR):
+    """Install and start a systemd user service that keeps one Remote Control session running.
+
+    Each --name is its own service, so several accounts (Claude config directories)
+    or projects can each keep a Remote Control session available.
+    """
     if args and args[0] == "--":
         args = args[1:]
     args = args or ["remote-control"]
     if not requests_remote_control(args):
         raise ValueError("The background service runs a Remote Control session; pass e.g. -- remote-control")
-    remote_control_settings(load_config(source))
+    rc = remote_control_settings(load_config(source))
     directory = (directory or Path.home()).expanduser().absolute()
     if not directory.is_dir():
         raise ValueError("Requested working directory does not exist")
     executable = find_claude(claude)
-    unit = unit_dir / SERVICE_NAME
-    owned_unit(unit)
-    text = service_unit(source, directory, executable, args, os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"))
+    unit_file = service_name(name)
+    unit = unit_dir / unit_file
+    replacing = owned_unit(unit)
+    # systemd does not inherit this shell's CLAUDE_CONFIG_DIR, so record the account explicitly.
+    if config_dir is None and "CLAUDE_CONFIG_DIR" in os.environ and "config_dir" not in rc:
+        config_dir = os.environ["CLAUDE_CONFIG_DIR"]
+    if config_dir is not None:
+        config_dir = claude_config_dir(config_dir)
+    account = config_dir or (config_path(rc["config_dir"], "remote_control.config_dir") if "config_dir" in rc
+                             else Path.home() / ".claude")
+    for other in managed_units(unit_dir):
+        if other != unit and unit_config_dir(other) == (str(config_dir) if config_dir else None):
+            print(f"Note: {other.name} already runs Remote Control for {account}.", file=sys.stderr)
+    text = service_unit(source, directory, executable, args, os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+                        config_dir, name)
     unit_dir.mkdir(parents=True, exist_ok=True)
     temporary = unit.with_name("." + unit.name + ".tmp")
     temporary.write_text(text)
     temporary.chmod(0o644)
     os.replace(temporary, unit)
-    write_object(state, {"unit": str(unit), "source": str(Path(source).resolve()), "directory": str(directory)})
     systemctl("daemon-reload")
-    systemctl("enable", "--now", SERVICE_NAME)
-    print(f"Installed and started {SERVICE_NAME}; it restarts on failure and starts at login.")
-    print("Before relying on it, sign in once interactively (`claude`, then /login) with the same account.")
-    print(f"To keep it running while you are logged out: sudo loginctl enable-linger {pwd.getpwuid(os.getuid()).pw_name}")
-    print(f"Logs: journalctl --user -u {SERVICE_NAME} -f")
+    if replacing:
+        systemctl("restart", unit_file)
+    systemctl("enable", "--now", unit_file)
+    print(f"{'Replaced and restarted' if replacing else 'Installed and started'} {unit_file}: "
+          f"Remote Control for {account} in {directory}.")
+    print("It restarts on failure and starts again at login.")
+    if not (account / ".credentials.json").is_file():
+        print(f"Warning: no saved sign-in found in {account}. Sign in once first: "
+              f"CLAUDE_CONFIG_DIR={account} claude, then /login.", file=sys.stderr)
+    hint = linger_hint()
+    if hint:
+        print(hint)
+    print(f"Logs: journalctl --user -u {unit_file} -f")
 
 
-def uninstall_service(unit_dir=SERVICE_DIR, state=SERVICE_STATE):
-    unit = unit_dir / SERVICE_NAME
+def uninstall_service(name=None, unit_dir=SERVICE_DIR):
+    unit_file = service_name(name)
+    unit = unit_dir / unit_file
     removed = owned_unit(unit)
     if removed:
-        systemctl("disable", "--now", SERVICE_NAME, check=False)
+        systemctl("disable", "--now", unit_file, check=False)
         unit.unlink()
         systemctl("daemon-reload")
-    if state.exists() and not state.is_symlink():
-        state.unlink()
-    print(f"Stopped and removed {SERVICE_NAME}." if removed else f"{SERVICE_NAME} is not installed; nothing to remove.")
+    print(f"Stopped and removed {unit_file}." if removed else f"{unit_file} is not installed; nothing to remove.")
 
 
-def service_status(unit_dir=SERVICE_DIR):
-    unit = unit_dir / SERVICE_NAME
-    if not owned_unit(unit):
-        raise ValueError(f"{SERVICE_NAME} is not installed")
-    active = systemctl("is-active", SERVICE_NAME, check=False).stdout.strip() or "unknown"
-    enabled = systemctl("is-enabled", SERVICE_NAME, check=False).stdout.strip() or "unknown"
-    print(f"{SERVICE_NAME}: {active}, {enabled} at login.")
-    print(f"Logs: journalctl --user -u {SERVICE_NAME} -f")
-    return active
+def service_status(name=None, unit_dir=SERVICE_DIR):
+    """Report one named service, or every service this tool installed."""
+    if name is not None:
+        unit = unit_dir / service_name(name)
+        if not owned_unit(unit):
+            raise ValueError(f"{unit.name} is not installed")
+        units = [unit]
+    else:
+        units = managed_units(unit_dir)
+        if not units:
+            raise ValueError("No Remote Control services from this tool are installed")
+    states = {}
+    for unit in units:
+        active = systemctl("is-active", unit.name, check=False).stdout.strip() or "unknown"
+        enabled = systemctl("is-enabled", unit.name, check=False).stdout.strip() or "unknown"
+        account = unit_config_dir(unit) or "default account"
+        print(f"{unit.name}: {active}, {enabled} at login ({account}).")
+        states[unit.name] = active
+    print(f"Logs: journalctl --user -u {units[0].name} -f")
+    return states
 
 
 def describe_remote_control(settings):
@@ -617,24 +716,30 @@ def main(argv=None):
         if action in ("run", "install"):
             sub.add_argument("--claude", help="Claude CLI to start (default: claude on PATH)")
             sub.add_argument("--dir", "-C", dest="directory", type=Path, help="working directory")
+            sub.add_argument("--config-dir", help="Claude config directory (account) for this session")
             sub.add_argument("args", nargs=argparse.REMAINDER, help="arguments forwarded to claude after --")
+        if action in ("install", "uninstall", "status"):
+            sub.add_argument("--name", help="Linux: name of one background service, for several accounts or projects")
         if action == "exec":
             sub.add_argument("engine", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     if not IS_MACOS and args.action in ("install", "uninstall", "status"):
         if args.action == "install":
-            with transaction_lock(SERVICE_STATE):
-                install_service(args.source, args.directory, args.args, args.claude)
+            with transaction_lock(SERVICE_LOCK):
+                install_service(args.source, args.directory, args.args, args.claude, args.config_dir, args.name)
         elif args.action == "uninstall":
-            with transaction_lock(SERVICE_STATE):
-                uninstall_service()
+            with transaction_lock(SERVICE_LOCK):
+                uninstall_service(args.name)
         else:
-            service_status()
+            service_status(args.name)
         return
-    if args.action == "install" and (args.args or args.directory or args.claude):
-        raise ValueError("--claude, --dir and forwarded arguments apply to the Linux background service only")
+    if args.action in ("install", "uninstall", "status") and (
+            args.name or getattr(args, "args", None) or getattr(args, "directory", None)
+            or getattr(args, "claude", None) or getattr(args, "config_dir", None)):
+        raise ValueError("--name, --claude, --dir, --config-dir and forwarded arguments apply to the Linux "
+                         "background service only")
     if args.action == "run":
-        run_cli(args.args, args.source, args.claude, args.directory)
+        run_cli(args.args, args.source, args.claude, args.directory, args.config_dir)
         return
     if args.action in ("_install-policy", "_uninstall-policy"):
         uid = int(os.environ.get("SUDO_UID", "-1"))

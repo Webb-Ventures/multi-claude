@@ -147,19 +147,34 @@ class LinuxServiceTests(unittest.TestCase):
         self.engine.write_text("#!/bin/sh\nexit 0\n")
         self.engine.chmod(0o700)
         self.units = self.root / "systemd/user"
-        self.state = self.root / "state/linux-service.json"
-        self.unit = self.units / proxy.SERVICE_NAME
+        self.home = self.root / "home"
+        (self.home / ".claude").mkdir(parents=True)
+        (self.home / ".claude/.credentials.json").write_text("{}")
+        self.client = self.home / ".claude-client"
+        self.client.mkdir()
+        (self.client / ".credentials.json").write_text("{}")
+        self.unsigned = self.home / ".claude-unsigned"
+        self.unsigned.mkdir()
+        for patcher in (mock.patch.object(proxy, "linger_hint", return_value=None),
+                        mock.patch.object(proxy.Path, "home", return_value=self.home),
+                        mock.patch.dict(proxy.os.environ, {"PATH": "/usr/bin:/bin"}, clear=True)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
-    def install(self, args=("--", "remote-control", "--name", "100% $HOME \"x\"")):
-        with mock.patch.object(proxy, "systemctl") as systemctl, mock.patch.object(proxy.os, "geteuid", return_value=1000), \
-                mock.patch.object(proxy.pwd, "getpwuid", return_value=mock.Mock(pw_name="tester")), \
-                contextlib.redirect_stdout(io.StringIO()):
-            proxy.install_service(self.source, self.root, list(args), str(self.engine), self.units, self.state)
-        return systemctl
+    def unit(self, name=None):
+        return self.units / proxy.service_name(name)
+
+    def install(self, args=("--", "remote-control"), name=None, config_dir=None, euid=0):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(proxy, "systemctl") as systemctl, mock.patch.object(proxy.os, "geteuid", return_value=euid), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            proxy.install_service(self.source, self.root, list(args), str(self.engine),
+                                  config_dir=config_dir, name=name, unit_dir=self.units)
+        return systemctl, out.getvalue(), err.getvalue()
 
     def test_service_unit_is_quoted_and_holds_no_secret(self):
-        systemctl = self.install()
-        text = self.unit.read_text()
+        systemctl, out, err = self.install(args=("--", "remote-control", "--name", "100% $HOME \"x\""))
+        text = self.unit().read_text()
         self.assertTrue(text.startswith(proxy.SERVICE_MARKER + "\n"))
         self.assertNotIn(TOKEN, text)
         exec_start = next(line for line in text.splitlines() if line.startswith("ExecStart="))
@@ -167,46 +182,113 @@ class LinuxServiceTests(unittest.TestCase):
         self.assertIn('"100%% $$HOME \\"x\\""', exec_start)
         self.assertIn("Restart=on-failure", text)
         self.assertEqual([c.args for c in systemctl.call_args_list],
-                         [("daemon-reload",), ("enable", "--now", proxy.SERVICE_NAME)])
-        self.assertEqual(json.loads(self.state.read_text())["unit"], str(self.unit))
+                         [("daemon-reload",), ("enable", "--now", "claude-code-remote-control.service")])
+        self.assertIn(str(self.home / ".claude"), out)
+        self.assertEqual(err, "")
 
-    def test_default_service_session_is_remote_control(self):
-        self.install(args=())
-        self.assertIn('"--" "remote-control"', self.unit.read_text())
+    def test_root_is_allowed_and_default_session_is_remote_control(self):
+        self.install(args=(), euid=0)
+        self.assertIn('"--" "remote-control"', self.unit().read_text())
+
+    def test_one_service_per_account_and_project(self):
+        self.install(name="work", args=("--", "rc"))
+        _, out, _ = self.install(name="client", config_dir=str(self.client), args=("--", "rc"))
+        self.assertTrue(self.unit("work").exists() and self.unit("client").exists())
+        self.assertNotIn("--config-dir", self.unit("work").read_text())
+        self.assertIn('"--config-dir" "%s" "--" "rc"' % self.client, self.unit("client").read_text())
+        self.assertEqual(proxy.unit_config_dir(self.unit("client")), str(self.client))
+        self.assertIsNone(proxy.unit_config_dir(self.unit("work")))
+        self.assertIn("Description=Claude Code Remote Control through multi-claude (client)", self.unit("client").read_text())
+        self.assertIn(str(self.client), out)
+        self.assertEqual([u.name for u in proxy.managed_units(self.units)],
+                         ["claude-code-remote-control-client.service", "claude-code-remote-control-work.service"])
+
+    def test_inherited_config_dir_is_recorded_in_the_unit(self):
+        with mock.patch.dict(proxy.os.environ, {"CLAUDE_CONFIG_DIR": str(self.client)}):
+            self.install(name="client")
+        self.assertEqual(proxy.unit_config_dir(self.unit("client")), str(self.client))
+
+    def test_same_account_twice_and_missing_sign_in_are_flagged(self):
+        self.install(name="one", config_dir=str(self.client))
+        _, _, err = self.install(name="two", config_dir=str(self.client))
+        self.assertIn("claude-code-remote-control-one.service already runs Remote Control", err)
+        _, _, err = self.install(name="unsigned", config_dir=str(self.unsigned))
+        self.assertIn(f"no saved sign-in found in {self.unsigned}", err)
+        with self.assertRaisesRegex(ValueError, "does not exist"):
+            self.install(name="missing", config_dir=str(self.home / ".claude-nope"))
+
+    def test_reinstall_restarts_with_new_settings(self):
+        self.install(name="client")
+        systemctl, out, _ = self.install(name="client", config_dir=str(self.client))
+        self.assertIn(("restart", "claude-code-remote-control-client.service"), [c.args for c in systemctl.call_args_list])
+        self.assertIn("Replaced and restarted", out)
+
+    def test_invalid_names(self):
+        for name in ("", "-x", "a/b", "a b", "x" * 41, "../etc"):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "--name"):
+                proxy.service_name(name)
 
     def test_service_refuses_non_remote_control_and_foreign_units(self):
         with self.assertRaisesRegex(ValueError, "Remote Control session"):
             self.install(args=("--", "-p", "prompt"))
         self.units.mkdir(parents=True)
-        self.unit.write_text("[Service]\nExecStart=/bin/true\n")
-        for action in (self.install, lambda: proxy.uninstall_service(self.units, self.state),
-                       lambda: proxy.service_status(self.units)):
+        self.unit("client").write_text("[Service]\nExecStart=/bin/true\n")
+        for action in (lambda: self.install(name="client"), lambda: proxy.uninstall_service("client", self.units),
+                       lambda: proxy.service_status("client", self.units)):
             with self.subTest(action=action), self.assertRaisesRegex(ValueError, "not created by this tool"):
                 action()
-        self.assertEqual(self.unit.read_text(), "[Service]\nExecStart=/bin/true\n")
+        self.assertEqual(self.unit("client").read_text(), "[Service]\nExecStart=/bin/true\n")
+        self.assertEqual(proxy.managed_units(self.units), [])
 
     def test_uninstall_and_status(self):
-        self.install()
+        self.install(name="work")
+        self.install(name="client", config_dir=str(self.client))
         result = mock.Mock(stdout="active\n")
         with mock.patch.object(proxy, "systemctl", return_value=result), contextlib.redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(proxy.service_status(self.units), "active")
-        self.assertIn("active", out.getvalue())
+            states = proxy.service_status(unit_dir=self.units)
+            self.assertEqual(proxy.service_status("client", self.units), {"claude-code-remote-control-client.service": "active"})
+        self.assertEqual(set(states), {"claude-code-remote-control-client.service", "claude-code-remote-control-work.service"})
+        self.assertIn(f"({self.client})", out.getvalue())
+        self.assertIn("(default account)", out.getvalue())
         with mock.patch.object(proxy, "systemctl") as systemctl, contextlib.redirect_stdout(io.StringIO()):
-            proxy.uninstall_service(self.units, self.state)
-            proxy.uninstall_service(self.units, self.state)  # Idempotent.
-        self.assertFalse(self.unit.exists())
-        self.assertFalse(self.state.exists())
-        self.assertEqual(systemctl.call_args_list[0].args, ("disable", "--now", proxy.SERVICE_NAME))
+            proxy.uninstall_service("client", self.units)
+            proxy.uninstall_service("client", self.units)  # Idempotent.
+        self.assertFalse(self.unit("client").exists())
+        self.assertTrue(self.unit("work").exists())
+        self.assertEqual(systemctl.call_args_list[0].args, ("disable", "--now", "claude-code-remote-control-client.service"))
         with self.assertRaisesRegex(ValueError, "not installed"):
-            proxy.service_status(self.units)
-
-    def test_root_is_refused(self):
-        with mock.patch.object(proxy.os, "geteuid", return_value=0), self.assertRaisesRegex(ValueError, "not root"):
-            proxy.install_service(self.source, self.root, [], str(self.engine), self.units, self.state)
+            proxy.service_status("client", self.units)
 
     def test_missing_systemd_points_to_run(self):
         with mock.patch.object(proxy.shutil, "which", return_value=None), self.assertRaisesRegex(ValueError, "tmux"):
             proxy.systemctl("daemon-reload")
+
+    def test_systemctl_supplies_missing_runtime_dir(self):
+        with mock.patch.object(proxy.shutil, "which", return_value="/bin/systemctl"), \
+                mock.patch.object(proxy.os, "getuid", return_value=0), \
+                mock.patch.object(proxy.subprocess, "run", return_value=mock.Mock(returncode=0)) as run:
+            with mock.patch.object(proxy.Path, "is_dir", return_value=True):
+                proxy.systemctl("daemon-reload")
+            self.assertEqual(run.call_args.kwargs["env"]["XDG_RUNTIME_DIR"], "/run/user/0")
+            with mock.patch.dict(proxy.os.environ, {"XDG_RUNTIME_DIR": "/custom"}):
+                proxy.systemctl("daemon-reload")
+            self.assertEqual(run.call_args.kwargs["env"]["XDG_RUNTIME_DIR"], "/custom")
+            with mock.patch.object(proxy.Path, "is_dir", return_value=False), \
+                    mock.patch.object(proxy.pwd, "getpwuid", return_value=mock.Mock(pw_name="root")), \
+                    self.assertRaisesRegex(ValueError, "enable-linger root"):
+                proxy.systemctl("daemon-reload")
+
+    def test_linger_hint(self):
+        user = mock.Mock(pw_name="tester")
+        with mock.patch.object(proxy.pwd, "getpwuid", return_value=user), \
+                mock.patch.object(proxy.shutil, "which", return_value="/usr/bin/loginctl"):
+            for linger, euid, expected in (("yes", 0, None), ("no", 0, "loginctl enable-linger tester"),
+                                           ("no", 1000, "sudo loginctl enable-linger tester")):
+                with self.subTest(linger=linger, euid=euid), \
+                        mock.patch.object(proxy.subprocess, "run", return_value=mock.Mock(stdout=linger + "\n")), \
+                        mock.patch.object(proxy.os, "geteuid", return_value=euid):
+                    hint = LINGER_HINT()  # The real function; setUp replaces proxy.linger_hint.
+                    self.assertEqual(hint if expected is None else hint.split(": ", 1)[1], expected)
 
     def test_linux_check_skips_desktop_and_reports_remote_control(self):
         gateway = proxy.Gateway("https://primary.example/", TOKEN)
@@ -219,13 +301,34 @@ class LinuxServiceTests(unittest.TestCase):
         self.assertIn("Not macOS", out.getvalue())
         self.assertIn("Remote Control: allowed", out.getvalue())
 
-    def test_linux_install_dispatches_to_service(self):
-        with mock.patch.object(proxy, "IS_MACOS", False), mock.patch.object(proxy, "SERVICE_STATE", self.state), \
-                mock.patch.object(proxy, "install_service") as install:
-            proxy.main(["install", "--config", str(self.source), "--dir", str(self.root), "--", "remote-control"])
-        install.assert_called_once_with(self.source, self.root, ["--", "remote-control"], None)
+    def test_linux_commands_dispatch_with_name_and_config_dir(self):
+        with mock.patch.object(proxy, "IS_MACOS", False), mock.patch.object(proxy, "SERVICE_LOCK", self.root / "lock"), \
+                mock.patch.object(proxy, "install_service") as install, \
+                mock.patch.object(proxy, "uninstall_service") as uninstall, \
+                mock.patch.object(proxy, "service_status") as status:
+            proxy.main(["install", "--config", str(self.source), "--name", "client", "--config-dir", str(self.client),
+                        "--dir", str(self.root), "--", "rc"])
+            proxy.main(["uninstall", "--name", "client"])
+            proxy.main(["status"])
+        install.assert_called_once_with(self.source, self.root, ["--", "rc"], None, str(self.client), "client")
+        uninstall.assert_called_once_with("client")
+        status.assert_called_once_with(None)
         with mock.patch.object(proxy, "IS_MACOS", True), self.assertRaisesRegex(ValueError, "Linux"):
-            proxy.main(["install", "--config", str(self.source), "--", "remote-control"])
+            proxy.main(["install", "--config", str(self.source), "--name", "client"])
+
+    def test_run_with_config_dir_selects_account_for_any_session(self):
+        gateway = proxy.Gateway("https://primary.example/", TOKEN)
+        with mock.patch.object(proxy, "select_gateway", return_value=gateway), \
+                mock.patch.object(proxy.os, "execve") as execute, contextlib.redirect_stderr(io.StringIO()):
+            proxy.run_cli(["--", "-p", "hi"], self.source, claude=str(self.engine), config_dir=str(self.client))
+            self.assertEqual(execute.call_args.args[2]["CLAUDE_CONFIG_DIR"], str(self.client))
+            self.assertEqual(execute.call_args.args[2]["ANTHROPIC_AUTH_TOKEN"], TOKEN)
+            proxy.run_cli(["rc"], self.source, claude=str(self.engine), config_dir=str(self.client))
+            self.assertEqual(execute.call_args.args[2]["CLAUDE_CONFIG_DIR"], str(self.client))
+            self.assertNotIn("ANTHROPIC_AUTH_TOKEN", execute.call_args.args[2])
+
+
+LINGER_HINT = proxy.linger_hint
 
 
 if __name__ == "__main__":
