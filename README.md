@@ -140,8 +140,30 @@ Configuration precedence:
 3. An ignored `config.local.json` next to the scripts, if present.
 4. `~/.config/multi-claude/config.json`.
 
+To keep the key out of the config file, point `gateway_token_file` at a file you
+already keep secrets in, at any absolute path or a path starting with `~`. The
+file is read as plain text and never sourced or run. On its own, the whole file is
+the key. Add `gateway_token_key` when the file holds `KEY=value` lines, such as a
+`.env` file; the first line for that key is used, and an `export ` prefix or
+surrounding quotes are allowed:
+
+```json
+{
+  "gateway_urls": [
+    "http://localhost:8317/"
+  ],
+  "gateway_token_file": "~/.config/multi-claude/secrets.env",
+  "gateway_token_key": "GATEWAY_TOKEN"
+}
+```
+
+Set either `gateway_token` or `gateway_token_file`, not both. Keep the token file
+private (`chmod 600`).
+
 `MULTI_CLAUDE_GATEWAY_URL` and `MULTI_CLAUDE_GATEWAY_TOKEN` override their JSON
-values. Environment-only configuration works for terminal use, but an installed
+values. `MULTI_CLAUDE_GATEWAY_TOKEN_FILE` and `MULTI_CLAUDE_GATEWAY_TOKEN_KEY` set
+the token file and key the same way; `MULTI_CLAUDE_GATEWAY_TOKEN` wins over a token
+file from either place. Environment-only configuration works for terminal use, but an installed
 Desktop launcher should use a persistent private JSON file. Do not put credentials
 in command-line arguments.
 
