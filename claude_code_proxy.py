@@ -704,7 +704,132 @@ def describe_remote_control(settings):
     return f"Remote Control: allowed through the forward proxy {forward}."
 
 
+RC_USAGE = """usage: claude-rc [PROFILE] [claude remote-control options]
+       claude-rc --list
+
+Start Claude Code Remote Control in this terminal and folder for one Claude account.
+PROFILE is a Claude config directory: none or "default" is ~/.claude, "NAME" is
+~/.claude-NAME, or a name mapped in the config file's "profiles". Run it inside
+tmux to keep it open after you log out. Inference goes directly to Anthropic on
+that account, or through remote_control.forward_proxy_url if configured; the
+gateway is never used for Remote Control.
+
+examples:
+  claude-rc                     default account
+  claude-rc work                ~/.claude-work
+  claude-rc work --spawn worktree
+"""
+
+
+def rc_settings(source=None):
+    """Load the config for Remote Control; the gateway settings are optional here."""
+    path = Path(source) if source is not None else _config.default_config_path()
+    gateway_env = any(name.startswith("MULTI_CLAUDE_GATEWAY") for name in os.environ)
+    if not path.expanduser().exists() and not gateway_env:
+        return {}
+    return load_config(path)
+
+
+def profile_dirs(settings):
+    """Map profile name to Claude config directory; "default" is Claude Code's own default."""
+    profiles = {"default": None}
+    for path in sorted(Path.home().glob(".claude-*")):
+        if path.is_dir() and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", path.name[len(".claude-"):]):
+            profiles[path.name[len(".claude-"):]] = path
+    configured = settings.get("profiles", {})
+    if not isinstance(configured, dict):
+        raise ValueError("profiles must be a JSON object of name to Claude config directory")
+    for name, value in configured.items():
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name) or name == "default":
+            raise ValueError(f"Invalid profile name in profiles: {name!r}")
+        profiles[name] = config_path(value, f"profiles.{name}")
+    return profiles
+
+
+def profile_account(config_dir):
+    """(signed in or None if unknown, email or None) for a Claude config directory."""
+    home = config_dir or Path.home() / ".claude"
+    state = (config_dir / ".claude.json") if config_dir else Path.home() / ".claude.json"
+    email = None
+    try:
+        account = json.loads(state.read_text()).get("oauthAccount") or {}
+        email = account.get("emailAddress") if isinstance(account, dict) else None
+    except (OSError, ValueError, AttributeError):
+        pass
+    # On macOS the sign-in lives in the Keychain, so it cannot be checked from files.
+    signed_in = None if IS_MACOS else (home / ".credentials.json").is_file()
+    return signed_in, email
+
+
+def running_remote_control(config_dir, directory):
+    """PIDs of Remote Control servers already running for this account in this folder (Linux only)."""
+    found = []
+    wanted = str(config_dir) if config_dir else None
+    for entry in Path("/proc").glob("[0-9]*"):
+        try:
+            argv = (entry / "cmdline").read_bytes().split(b"\0")
+            if len(argv) < 2 or Path(argv[0].decode()).name != "claude" or argv[1] not in (b"rc", b"remote-control"):
+                continue
+            env = dict(item.split("=", 1) for item in (entry / "environ").read_text().split("\0") if "=" in item)
+            if env.get("CLAUDE_CONFIG_DIR") == wanted and Path(os.readlink(entry / "cwd")) == directory:
+                found.append(int(entry.name))
+        except (OSError, ValueError, UnicodeError):
+            continue
+    return found
+
+
+def rc_command(argv, source=None, claude=None):
+    """claude-rc: Remote Control in this terminal for one named Claude account."""
+    args = list(argv)
+    if args and args[0] in ("-h", "--help"):
+        print(RC_USAGE, end="")
+        return
+    settings = rc_settings(source)
+    profiles = profile_dirs(settings)
+    if args and args[0] == "--list":
+        for name, config_dir in profiles.items():
+            signed_in, email = profile_account(config_dir)
+            status = {True: "signed in", False: "NOT signed in", None: "sign-in not checked"}[signed_in]
+            print(f"{name:<12} {str(config_dir or Path.home() / '.claude'):<32} {email or '-':<32} {status}")
+        return
+    name = "default"
+    if args and not args[0].startswith("-"):
+        name = args.pop(0)
+    if args and args[0] == "--":
+        args.pop(0)
+    if name not in profiles:
+        raise ValueError(f"Unknown profile {name!r}. Available: {', '.join(profiles)}. "
+                         f"A profile is a ~/.claude-NAME directory or an entry in the config's \"profiles\".")
+    config_dir = profiles[name]
+    if config_dir is not None and not config_dir.is_dir():
+        raise ValueError(f"Profile {name!r} points at {config_dir}, which does not exist")
+    signed_in, email = profile_account(config_dir)
+    login = (f"CLAUDE_CONFIG_DIR={config_dir} " if config_dir else "") + "claude"
+    if signed_in is False:
+        raise ValueError(f"Profile {name!r} is not signed in. Sign in once with: {login}, then /login")
+    executable = find_claude(claude)
+    parent = dict(os.environ)
+    parent.pop("CLAUDE_CONFIG_DIR", None)  # The profile decides the account, never an exported value.
+    env, forward = remote_control_environment(parent, settings, use_config_dir=False)
+    if config_dir is not None:
+        env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    here = Path.cwd()
+    if not IS_MACOS:
+        duplicates = running_remote_control(config_dir, here)
+        if duplicates:
+            print(f"claude-rc: note: Remote Control for {name!r} is already running here "
+                  f"(pid {', '.join(map(str, duplicates))}); starting another.", file=sys.stderr)
+    route = f"through the forward proxy {forward}" if forward else "directly to Anthropic"
+    print(f"claude-rc: {name} ({email or config_dir or '~/.claude'}) in {here}; inference goes {route}.",
+          file=sys.stderr, flush=True)
+    os.execve(str(executable), [str(executable), "remote-control", *args], env)
+
+
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] == "rc":
+        rc_command(argv[1:])
+        return
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
     for action in ("check", "models", "command", "exec", "run", "install", "uninstall", "status",
@@ -787,5 +912,5 @@ if __name__ == "__main__":
     try:
         main()
     except (OSError, ValueError, KeyError) as error:
-        print(f"claude-code-proxy: {error}", file=sys.stderr)
+        print(f"{'claude-rc' if sys.argv[1:2] == ['rc'] else 'claude-code-proxy'}: {error}", file=sys.stderr)
         sys.exit(1)

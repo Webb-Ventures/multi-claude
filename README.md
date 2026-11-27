@@ -8,6 +8,8 @@ multiple Claude Desktop profiles on one Mac.
   the gateway, while Desktop keeps its normal account interface and Chat/Cowork
   routing. On Linux it starts the Claude Code CLI through the gateway and can keep
   a **Remote Control** session running as a background systemd service.
+- **`claude-rc`** starts Remote Control in your terminal for one named Claude
+  account: `claude-rc`, `claude-rc work`.
 - **`claude_profiles.py`** builds named, colour-coded `.app` launchers or optional
   full runtime copies with separate Desktop account data and, by default,
   separate Claude Code configuration.
@@ -314,6 +316,42 @@ python3 -I claude_code_proxy.py run --config-dir ~/.claude-client -- rc
 Without `--config-dir`, `run` keeps any `CLAUDE_CONFIG_DIR` you already exported,
 then `remote_control.config_dir` for Remote Control sessions, then Claude Code's
 default `~/.claude`.
+
+### `claude-rc`: Remote Control for a named account
+
+`claude-rc` is the short way to start Remote Control on one of several accounts.
+It runs in the current terminal and folder, like `claude rc`, so start it inside
+tmux to keep it open after you log out. Link it onto your `PATH` once, from a
+checkout that stays put:
+
+```sh
+ln -s "$PWD/claude-rc" ~/.local/bin/claude-rc
+```
+
+Then:
+
+```sh
+claude-rc                      # default account (~/.claude)
+claude-rc work                 # ~/.claude-work
+claude-rc work --spawn worktree
+claude-rc --list               # profiles, their accounts, and sign-in
+```
+
+A profile is any `~/.claude-NAME` directory, plus `default` for `~/.claude`. To use
+other directories, map names in the config file:
+
+```json
+"profiles": { "client": "~/accounts/client-claude" }
+```
+
+Everything after the profile name is passed to `claude remote-control`. The profile
+always decides the account: an exported `CLAUDE_CONFIG_DIR` is ignored, and so are
+gateway variables, because Remote Control cannot use a gateway. Inference goes
+directly to Anthropic on that account, or through `remote_control.forward_proxy_url`
+if you set one. The gateway settings in the config file are optional for
+`claude-rc`. On Linux it stops with the exact sign-in command when a profile has no
+saved sign-in, and notes when that account already has Remote Control running in
+the same folder. On macOS the sign-in is in the Keychain, so it is not checked.
 
 ### Background Remote Control service
 

@@ -1,0 +1,21 @@
+#!/bin/sh
+# claude-rc [PROFILE] [claude remote-control options]
+#   Start Claude Code Remote Control in this terminal for one Claude account:
+#   claude-rc            default account (~/.claude)
+#   claude-rc work       ~/.claude-work
+#   claude-rc --list     show profiles and their sign-in
+#
+# Install by linking it onto your PATH from a checkout that stays put:
+#   ln -s "$PWD/claude-rc" ~/.local/bin/claude-rc
+
+# Follow symlinks to find the checkout that holds claude_code_proxy.py.
+script=$0
+while [ -L "$script" ]; do
+  link=$(readlink "$script")
+  case $link in
+    /*) script=$link ;;
+    *) script=$(dirname "$script")/$link ;;
+  esac
+done
+here=$(cd "$(dirname "$script")" && pwd) || exit 1
+exec python3 -I "$here/claude_code_proxy.py" rc "$@"
