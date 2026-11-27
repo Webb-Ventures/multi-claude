@@ -6,7 +6,8 @@ multiple Claude Desktop profiles on one Mac.
 - **`start-cc.sh`** launches the installed Claude Code CLI through a gateway.
 - **`claude_code_proxy.py`** configures Desktop's **local Code sessions only** to use
   the gateway, while Desktop keeps its normal account interface and Chat/Cowork
-  routing.
+  routing. On Linux it starts the Claude Code CLI through the gateway and can keep
+  a **Remote Control** session running as a background systemd service.
 - **`claude_profiles.py`** builds named, colour-coded `.app` launchers or optional
   full runtime copies with separate Desktop account data and, by default,
   separate Claude Code configuration.
@@ -44,8 +45,10 @@ subscription entitlements.
   Claude preference files rather than changing the bundle identity around them.
 - The Desktop corporate-launcher hook deliberately withholds Desktop inference
   credentials from the Code engine. The engine uses gateway authentication.
-  **Remote Control and other first-party-authenticated engine services are not
-  preserved by this route; the native launcher disables fast mode.**
+  **First-party-authenticated engine services are not preserved by this route; the
+  native launcher disables fast mode.** Remote Control works only for sessions the
+  proxy can recognise from their arguments, and those sessions bypass the gateway
+  (see [Remote Control sessions](#remote-control-sessions)).
 - The normal Desktop model picker is unchanged. A gateway must accept/map the
   Claude model IDs and helper-model requests Desktop sends. Arbitrary models
   advertised by a gateway are not automatically added to Desktop's picker.
@@ -63,6 +66,12 @@ For the CLI launcher:
 - Claude Code installed and available as `claude` on `PATH`.
 - A gateway implementing Anthropic's Messages API, including streaming and tool
   use. The Desktop preflight also requires `GET /v1/models`.
+
+For `claude_code_proxy.py` on a Linux server:
+
+- Python **3.10+**, and Claude Code installed as `claude` (or pass `--claude`).
+- A systemd user session for the optional background Remote Control service.
+- For Remote Control, a claude.ai account signed in to Claude Code on that server.
 
 For Desktop proxy/profile tools:
 
@@ -195,10 +204,11 @@ this standalone CLI wrapper, optionally add:
 This option does not override the Desktop profile launchers' individual Code
 config directories.
 
-**Remote Control:** this public launcher intentionally refuses `--rc`,
-`--remote-control`, and the Remote Control subcommand. It does not ship the private
-forward-proxy/certificate lane used by some custom setups, and never silently
-changes to direct subscription inference to make RC work.
+**Remote Control:** this launcher still refuses `--rc`, `--remote-control`, and
+the Remote Control subcommand, and never silently changes to direct subscription
+inference to make RC work. To run Remote Control sessions, use
+`claude_code_proxy.py run`, which handles them explicitly (see
+[Remote Control sessions](#remote-control-sessions)).
 
 ## 3. Route normal Desktop's local Code sessions through the proxy
 
@@ -271,6 +281,132 @@ even if the configuration-library metadata was not created yet.
 location before installing from a new checkout. Do not delete or move an installed
 checkout, interpreter, or private config file while its launcher still refers to
 those paths. Merely copying this repository does not replace an existing launcher.
+
+## 3b. Linux servers: the CLI and a background Remote Control session
+
+There is no Claude Desktop on Linux, so `claude_code_proxy.py` drives the Claude
+Code CLI instead. `check` skips the Desktop checks and tests only the gateway and
+the Remote Control settings:
+
+```sh
+python3 -I claude_code_proxy.py check
+```
+
+Start a CLI session through the gateway. Put Claude's own arguments after `--`:
+
+```sh
+python3 -I claude_code_proxy.py run -- --model claude-opus-5-5
+python3 -I claude_code_proxy.py run --dir /srv/project -- -p "summarise this repo"
+```
+
+`run` uses `claude` from `PATH`; pass `--claude /absolute/path/to/claude` to choose
+another.
+
+**Several Claude accounts.** Each Claude Code config directory is its own signed-in
+account. Pick one per session with `--config-dir`, which sets `CLAUDE_CONFIG_DIR`
+for that session, whether it uses the gateway or Remote Control:
+
+```sh
+python3 -I claude_code_proxy.py run --config-dir ~/.claude-work -- --model claude-opus-5-5
+python3 -I claude_code_proxy.py run --config-dir ~/.claude-client -- rc
+```
+
+Without `--config-dir`, `run` keeps any `CLAUDE_CONFIG_DIR` you already exported,
+then `remote_control.config_dir` for Remote Control sessions, then Claude Code's
+default `~/.claude`.
+
+### Background Remote Control service
+
+To keep a Remote Control session available on the server, sign in once
+interactively with the claude.ai account you want to use
+(`CLAUDE_CONFIG_DIR=<dir> claude`, then `/login`). Then install a service for it:
+
+```sh
+python3 -I claude_code_proxy.py install --dir /srv/project
+```
+
+This writes `~/.config/systemd/user/claude-code-remote-control.service`, which runs
+`claude_code_proxy.py run -- remote-control`, and then enables and starts it. It
+restarts on failure and starts again at login. Arguments after `--` replace the
+default `remote-control` and must still start a Remote Control session, for example
+`install -- rc --name build-server`. The unit holds no credentials; it points at
+your config file. Run `install` as the user whose accounts it should use; root is
+fine on a single-user server.
+
+**One service per account or project.** Give each service a `--name`. Each name is
+a separate unit, `claude-code-remote-control-<name>.service`:
+
+```sh
+python3 -I claude_code_proxy.py install --name work --dir ~/src/app -- rc
+python3 -I claude_code_proxy.py install --name client --config-dir ~/.claude-client --dir ~/src/client -- rc
+```
+
+If you exported `CLAUDE_CONFIG_DIR` when installing, the unit records it, because
+systemd does not inherit your shell's environment. `install` warns when that
+directory has no saved sign-in, or when another service already uses the same
+account. Running `install` again with the same name replaces and restarts that
+service.
+
+To keep services running while you are logged out (no `sudo` needed as root):
+
+```sh
+sudo loginctl enable-linger "$USER"
+```
+
+Check every service (or one with `--name`), follow a log, or remove one:
+
+```sh
+python3 -I claude_code_proxy.py status
+journalctl --user -u claude-code-remote-control-client.service -f
+python3 -I claude_code_proxy.py uninstall --name client
+```
+
+`install` and `uninstall` refuse to touch a unit file of that name they did not
+create. They work from non-interactive SSH sessions too: if `XDG_RUNTIME_DIR` is
+missing, it is set to `/run/user/<uid>`. Without systemd, run
+`claude_code_proxy.py run -- remote-control` under tmux or another supervisor
+instead.
+
+Starting a Remote Control session headlessly under systemd has not been verified on
+every Claude Code version. Check the logs after installing.
+
+### Remote Control sessions
+
+Claude Code allows Remote Control only when it talks to Anthropic's own API with a
+signed-in claude.ai account, and turns it off when `ANTHROPIC_BASE_URL` points at a
+gateway. So `run` (and the macOS Desktop wrapper) detect sessions started with
+`--rc`, `--remote-control`, or the `remote-control` / `rc` subcommand, and start
+them **without** the gateway URL and gateway key. A notice on stderr says where
+that session's inference goes:
+
+- **Directly to Anthropic** on the signed-in account, by default.
+- **Through a forward proxy**, if you configure one. Inference then still reaches
+  `api.anthropic.com` through your proxy. If a configured forward proxy is
+  unreachable, the session is refused. It never falls back to direct inference.
+
+All other sessions keep using the gateway. Optional settings:
+
+```json
+{
+  "remote_control": {
+    "config_dir": "~/.claude-remote",
+    "forward_proxy_url": "http://127.0.0.1:9801",
+    "forward_proxy_ca": "~/.config/multi-claude/forward-proxy-ca.pem"
+  }
+}
+```
+
+- `config_dir` sets `CLAUDE_CONFIG_DIR` for Remote Control sessions started by
+  `run` or the service, so they can use a different signed-in account. The Desktop
+  wrapper keeps Desktop's own config directory.
+- `forward_proxy_url` follows the same rules as gateway URLs: HTTPS, or HTTP to
+  loopback or a `.ts.net` host. Local hosts and your gateway hosts are added to
+  `NO_PROXY`.
+- `forward_proxy_ca` is passed as `NODE_EXTRA_CA_CERTS`, for a forward proxy that
+  presents its own certificate.
+- `"enabled": false` refuses Remote Control sessions instead.
+
+This repository does not include a forward proxy.
 
 ## 4. Create multiple named Desktop profile apps
 
