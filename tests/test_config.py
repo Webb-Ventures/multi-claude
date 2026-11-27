@@ -76,6 +76,49 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             cfg.load_gateways(self.path)
 
+    def test_token_file_plain_and_keyed(self):
+        url = "http://localhost:8317"
+        plain = Path(self.temp.name) / "token"
+        plain.write_text(TOKEN + "\n")
+        self.write({"gateway_urls": [url], "gateway_token_file": str(plain)})
+        self.assertEqual(cfg.load_config(self.path)["gateway_token"], TOKEN)
+        keyed = Path(self.temp.name) / "secrets.env"
+        keyed.write_text(f"# comment\nother=value\nexport my_token=\"{TOKEN}\"\nmy_token=second\n")
+        self.write({"gateway_urls": [url], "gateway_token_file": str(keyed), "gateway_token_key": "my_token"})
+        self.assertEqual(cfg.load_gateways(self.path)[0].token, TOKEN)
+        with patch.dict(os.environ, HOME=self.temp.name):
+            self.write({"gateway_urls": [url], "gateway_token_file": "~/token"})
+            self.assertEqual(cfg.load_config(self.path)["gateway_token"], TOKEN)
+
+    def test_token_file_environment_precedence(self):
+        url = "http://localhost:8317"
+        keyed = Path(self.temp.name) / "secrets.env"
+        keyed.write_text(f"my_token={TOKEN}\n")
+        self.write({"gateway_urls": [url], "gateway_token": "config-test-credential"})
+        os.environ.update(MULTI_CLAUDE_GATEWAY_TOKEN_FILE=str(keyed), MULTI_CLAUDE_GATEWAY_TOKEN_KEY="my_token")
+        self.assertEqual(cfg.load_config(self.path)["gateway_token"], TOKEN)
+        os.environ["MULTI_CLAUDE_GATEWAY_TOKEN"] = "env-test-credential"
+        self.assertEqual(cfg.load_config(self.path)["gateway_token"], "env-test-credential")
+
+    def test_token_file_errors_do_not_disclose_contents(self):
+        url = "http://localhost:8317"
+        keyed = Path(self.temp.name) / "secrets.env"
+        keyed.write_text(f"other={TOKEN}\n")
+        for data in ({"gateway_token_file": str(keyed), "gateway_token_key": "missing"},
+                     {"gateway_token_file": str(Path(self.temp.name) / "absent")},
+                     {"gateway_token_file": "relative/token"},
+                     {"gateway_token_file": ""},
+                     {"gateway_token_file": str(keyed), "gateway_token_key": "bad key"},
+                     {"gateway_token_file": str(keyed), "gateway_token": TOKEN},
+                     {"gateway_token_key": "other"}):
+            with self.subTest(data=data), self.assertRaises(ValueError) as error:
+                cfg.load_config(self.write({"gateway_urls": [url], **data}))
+            self.assertNotIn(TOKEN, str(error.exception))
+        empty = Path(self.temp.name) / "empty"
+        empty.write_text("\n")
+        with self.assertRaises(ValueError):
+            cfg.load_config(self.write({"gateway_urls": [url], "gateway_token_file": str(empty)}))
+
     def test_tcp_fallback_and_fail_closed(self):
         gateways = [cfg.Gateway("https://first.invalid", TOKEN), cfg.Gateway("https://second.invalid", TOKEN)]
         with patch.object(cfg.socket, "create_connection", side_effect=[OSError(TOKEN), MagicMock()]) as probe:
